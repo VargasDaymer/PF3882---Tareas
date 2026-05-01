@@ -10,8 +10,7 @@ app = FastAPI(
     description="""
 ## Contexto: Reservation
 
-Administrador de la concurrencia. Gestiona la asignación exclusiva de switches
-a un test durante una ventana de tiempo, garantizando que ningún otro proceso
+Gestiona la asignación exclusiva de switches a un test durante una ventana de tiempo, garantizando que ningún otro proceso
 pueda usar el mismo recurso simultáneamente.
 
 **Responsabilidades:**
@@ -233,6 +232,7 @@ def liberar_reservation(reservation_id: str, body: ReleaseRequest = ReleaseReque
     if reservation["estado"] != "ACTIVE":
         raise HTTPException(
             status_code=409,
+            detail=f"La reserva tiene estado '{reservation['estado']}' y no puede liberarse",
             detail=f"La reserva tiene estado '{reservation['estado']}' y no puede liberarse",
         )
 

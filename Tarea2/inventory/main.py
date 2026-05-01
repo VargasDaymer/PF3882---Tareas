@@ -9,7 +9,7 @@ app = FastAPI(
     description="""
 ## Contexto: Inventory
 
-Fuente de verdad del hardware disponible en el entorno de testing.
+Inventario del hardware disponible en el entorno de testing.
 Gestiona el catálogo de switches **Aruba** (plataformas 800, 850, 900, 950) y sus capacidades técnicas.
 
 **Responsabilidades:**
@@ -18,13 +18,13 @@ Gestiona el catálogo de switches **Aruba** (plataformas 800, 850, 900, 950) y s
 - Exponer una API de búsqueda filtrada por constraints técnicos
 - Permitir reservas basadas en criterios de búsqueda
 
-**Nota:** Este servicio NO conoce reservas, pruebas ni control de energía. Solo mantiene el catálogo.
+**Nota:** Este servicio NO conoce reservas. Solo mantiene el catálogo y su disponibilidad.
 
 **Topologías disponibles:**
-- Standalone — 1 switch, loop entre puertos propios
-- Dual Link — dos switches conectados entre sí
-- Stack — 2 switches en stack, vistos como 1
-- PoE Bench — 1 switch + 2 PDs conectados, ambiente de prueba con PoE
+- Standalone: 1 switch, loop entre puertos propios
+- Dual Link: 2 switches conectados entre sí
+- Stack: 2 switches en stack, vistos como 1
+- PoE Bench: 1 switch + 2 PDs conectados, ambiente de prueba con PoE
     """,
     version="1.0.0",
 )
@@ -95,7 +95,7 @@ def listar_switches(
     tags=["Switches"],
     summary="Buscar switches compatibles con un test",
     description="""
-Endpoint principal consumido por **Reservation** y **Scheduling**.
+Endpoint principal consumido por **Reservation**.
 
 Retorna únicamente switches con `estado_fisico = AVAILABLE` que cumplan
 con todos los constraints técnicos especificados.
