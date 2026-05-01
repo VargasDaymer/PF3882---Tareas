@@ -233,7 +233,6 @@ def liberar_reservation(reservation_id: str, body: ReleaseRequest = ReleaseReque
         raise HTTPException(
             status_code=409,
             detail=f"La reserva tiene estado '{reservation['estado']}' y no puede liberarse",
-            detail=f"La reserva tiene estado '{reservation['estado']}' y no puede liberarse",
         )
 
     reservation["estado"] = "RELEASED"

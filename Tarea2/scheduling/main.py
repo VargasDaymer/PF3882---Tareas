@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from strawberry.fastapi import GraphQLRouter
 
 RESERVATION_URL = "http://reservation:8002"
-REINTENTO_INTERVAL_SEGUNDOS = 10  # Intenta cada 10 segundos
+REINTENTO_INTERVAL_SEGUNDOS = 10  # Intenta cada 10 segundos. (Poco eficiente, pero suficiente)
 
 # ── Almacenamiento en memoria ──────────────────────────────────────────────────
 test_requests: dict[str, dict] = {}  # Vacío inicialmente, se llena al enviar tests
@@ -52,6 +52,13 @@ class SubmitResult:
 class CancelResult:
     success: bool
     message: str
+
+
+@strawberry.type
+class ReleaseResult:
+    success: bool
+    message: str
+    reservation: Optional[ReservationInfo]
 
 
 # ── Inputs GraphQL ─────────────────────────────────────────────────────────────
@@ -129,6 +136,25 @@ async def obtener_reserva(reservation_id: str) -> Optional[dict]:
         try:
             response = await client.get(
                 f"{RESERVATION_URL}/reservations/{reservation_id}",
+                timeout=5.0,
+            )
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except httpx.ConnectError:
+            return None
+
+
+async def liberar_reserva(reservation_id: str, motivo: str = "TestCompleted") -> Optional[dict]:
+    """
+    Libera una reserva en Reservation Service.
+    Marca la reserva como RELEASED y devuelve el switch a estado AVAILABLE.
+    """
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.patch(
+                f"{RESERVATION_URL}/reservations/{reservation_id}/release",
+                json={"motivo": motivo},
                 timeout=5.0,
             )
             if response.status_code == 200:
@@ -301,6 +327,34 @@ Recibe una nueva solicitud de test del tester.
 
         req["estado"] = "CANCELLED"
         return CancelResult(success=True, message=f"Test '{test_id}' cancelado correctamente")
+
+    @strawberry.mutation(description="""
+Libera una reserva activa, marcándola como RELEASED y devolviendo el switch a AVAILABLE.
+Esto permite que otros tests en QUEUED sean automáticamente asignados en el siguiente ciclo de reintentos.
+    """)
+    async def release_reservation(self, reservation_id: str, motivo: str = "TestCompleted") -> ReleaseResult:
+        resultado = await liberar_reserva(reservation_id, motivo)
+        
+        if not resultado:
+            return ReleaseResult(
+                success=False,
+                message=f"No se pudo liberar la reserva '{reservation_id}'. Verifica que exista y esté activa.",
+                reservation=None,
+            )
+        
+        return ReleaseResult(
+            success=True,
+            message=f"Reserva '{reservation_id}' liberada correctamente. El switch está nuevamente disponible.",
+            reservation=ReservationInfo(
+                id=resultado["id"],
+                test_id=resultado["test_id"],
+                switch_ids=resultado["switch_ids"],
+                estado=resultado["estado"],
+                creada_en=resultado["creada_en"],
+                expira_en=resultado["expira_en"],
+                liberada_en=resultado.get("liberada_en"),
+            ),
+        )
 
 
 # ── App FastAPI + GraphQL ──────────────────────────────────────────────────────
