@@ -1,0 +1,298 @@
+import uuid
+import json
+import os
+import httpx
+import aio_pika
+from datetime import datetime, timedelta
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+app = FastAPI(
+    title="Reservation Service",
+    description="""
+## Contexto: Reservation
+
+Gestiona la asignación exclusiva de switches a un test durante una ventana de tiempo, garantizando que ningún otro proceso
+pueda usar el mismo recurso simultáneamente.
+
+**Responsabilidades:**
+- Buscar switches AVAILABLE en **Inventory** basado en criterios técnicos
+- Asignar un switch compatible al test de forma exclusiva
+- Prevenir conflictos entre tests concurrentes
+- Gestionar expiración y liberación de reservas
+- Publicar eventos de mensajería asíncrona a **RabbitMQ**
+
+**Flujo de comunicación:**
+1. Recibe criterios de búsqueda (plataforma, SKU, PoE, topología, puertos)
+2. Consulta **Inventory** (puerto 8001) con `GET /switches/compatible`
+3. Selecciona el primer switch disponible
+4. Crea la reserva con estado `ACTIVE`
+5. Publica evento `ReservationCreated` → **RabbitMQ**
+6. Al liberar → publica evento `ReservationReleased` → **RabbitMQ**
+    """,
+    version="1.0.0",
+)
+
+INVENTORY_URL = os.getenv("INVENTORY_URL", "http://inventory:8001")
+RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://admin:admin@rabbitmq:5672/")
+
+# ── Almacenamiento en memoria ──────────────────────────────────────────────────
+reservations: dict[str, dict] = {}
+
+
+# ── RabbitMQ Publisher ─────────────────────────────────────────────────────────
+async def publish_event(event_type: str, payload: dict):
+    """
+    Publica un evento en RabbitMQ.
+    Exchange: testbed (tipo fanout)
+    Los mensajes llevan un campo 'event_type' para que el consumer los identifique.
+    """
+    try:
+        connection = await aio_pika.connect_robust(RABBITMQ_URL, timeout=5)
+        async with connection:
+            channel = await connection.channel()
+            exchange = await channel.declare_exchange(
+                "testbed",
+                aio_pika.ExchangeType.FANOUT,
+                durable=True,
+            )
+            message_body = json.dumps({"event_type": event_type, **payload})
+            await exchange.publish(
+                aio_pika.Message(
+                    body=message_body.encode(),
+                    content_type="application/json",
+                ),
+                routing_key="",
+            )
+            print(f"[RabbitMQ] Evento publicado: {event_type} → {message_body}")
+    except Exception as e:
+        # No interrumpir el flujo principal si RabbitMQ falla
+        print(f"[RabbitMQ] Error al publicar evento '{event_type}': {e}")
+
+# ── Modelos ────────────────────────────────────────────────────────────────────
+class ReservationRequest(BaseModel):
+    test_id: str
+    plataforma: str  # Obligatorio: Aruba 800, 850, 900, 950
+    sku: Optional[str] = None  # Opcional: 800.1, 800.2, etc
+    requiere_poe: bool  # Obligatorio: true/false
+    topologia: str  # Obligatorio: Standalone, Dual Link, Stack, PoE Bench
+    numero_puertos_min: Optional[int] = None  # Opcional
+    duracion_minutos: int = 60
+
+class ReservationResponse(BaseModel):
+    id: str
+    test_id: str
+    switch_ids: List[str]  # Lista de IDs (MACs) reservados
+    estado: str
+    creada_en: str
+    expira_en: str
+    liberada_en: Optional[str] = None
+
+class ReleaseRequest(BaseModel):
+    motivo: Optional[str] = "TestCompleted"
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+async def find_compatible_switches(
+    plataforma: str,
+    sku: Optional[str],
+    requiere_poe: bool,
+    topologia: str,
+    numero_puertos_min: Optional[int],
+) -> List[dict]:
+    """
+    Busca switches compatibles en Inventory usando /switches/compatible.
+    Retorna lista de switches AVAILABLE que cumplen los criterios.
+    """
+    async with httpx.AsyncClient() as client:
+        try:
+            # Construir query parameters
+            params = {
+                "plataforma": plataforma,
+                "requiere_poe": requiere_poe,
+                "topologia": topologia,
+            }
+            if sku:
+                params["sku"] = sku
+            if numero_puertos_min:
+                params["numero_puertos_min"] = numero_puertos_min
+            
+            response = await client.get(
+                f"{INVENTORY_URL}/switches/compatible",
+                params=params,
+                timeout=5.0,
+            )
+            
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 503:
+                raise HTTPException(status_code=503, detail="No se puede conectar con Inventory Service (8001)")
+            else:
+                return []
+        except httpx.ConnectError:
+            raise HTTPException(status_code=503, detail="No se puede conectar con Inventory Service (8001)")
+
+
+def switch_esta_reservado(switch_id: str) -> bool:
+    for r in reservations.values():
+        if r["estado"] == "ACTIVE" and switch_id in r["switch_ids"]:
+            return True
+    return False
+
+
+# ── Endpoints ──────────────────────────────────────────────────────────────────
+
+@app.get("/health", tags=["Health"], summary="Health check del servicio")
+def health():
+    return {"service": "reservation", "status": "ok", "port": 8002}
+
+
+@app.get(
+    "/reservations",
+    response_model=List[ReservationResponse],
+    tags=["Reservations"],
+    summary="Listar todas las reservas",
+    description="Retorna todas las reservas registradas en el sistema (activas, liberadas y expiradas).",
+)
+def listar_reservations():
+    return list(reservations.values())
+
+
+@app.get(
+    "/reservations/{reservation_id}",
+    response_model=ReservationResponse,
+    tags=["Reservations"],
+    summary="Obtener una reserva por ID",
+)
+def obtener_reservation(reservation_id: str):
+    if reservation_id not in reservations:
+        raise HTTPException(status_code=404, detail=f"Reserva '{reservation_id}' no encontrada")
+    return reservations[reservation_id]
+
+
+@app.post(
+    "/reservations",
+    response_model=ReservationResponse,
+    status_code=201,
+    tags=["Reservations"],
+    summary="Crear una nueva reserva",
+    description="""
+Solicita la reserva exclusiva de switches que cumplan los criterios especificados.
+
+**Flujo interno:**
+1. Busca switches AVAILABLE en **Inventory** que cumplen los criterios
+2. Selecciona el primer switch no reservado
+3. Crea la reserva con estado `ACTIVE` y tiempo de expiración
+4. Publica evento `ReservationCreated` en **RabbitMQ** → Scheduling actualiza el test a `SCHEDULED`
+
+Retorna error 404 si no hay switches disponibles, 409 si todos están reservados.
+    """,
+)
+async def crear_reservation(body: ReservationRequest):
+    # 1. Buscar switches compatibles en Inventory
+    switches_compatibles = await find_compatible_switches(
+        plataforma=body.plataforma,
+        sku=body.sku,
+        requiere_poe=body.requiere_poe,
+        topologia=body.topologia,
+        numero_puertos_min=body.numero_puertos_min,
+    )
+    
+    if not switches_compatibles:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No hay switches disponibles que cumplan los criterios: plataforma={body.plataforma}, sku={body.sku}, poe={body.requiere_poe}, topologia={body.topologia}",
+        )
+    
+    # 2. Seleccionar el primer switch que no esté reservado
+    switch_seleccionado = None
+    for switch in switches_compatibles:
+        if not switch_esta_reservado(switch["id"]):
+            switch_seleccionado = switch
+            break
+    
+    if not switch_seleccionado:
+        raise HTTPException(
+            status_code=409,
+            detail="Todos los switches compatibles ya están reservados. Intente más tarde.",
+        )
+    
+    # 3. Crear reserva
+    ahora = datetime.utcnow()
+    reservation_id = f"res-{str(uuid.uuid4())[:8]}"
+    reservation = {
+        "id": reservation_id,
+        "test_id": body.test_id,
+        "switch_ids": [switch_seleccionado["id"]],
+        "estado": "ACTIVE",
+        "creada_en": ahora.isoformat() + "Z",
+        "expira_en": (ahora + timedelta(minutes=body.duracion_minutos)).isoformat() + "Z",
+        "liberada_en": None,
+    }
+    reservations[reservation_id] = reservation
+
+    # 4. Publicar evento ReservationCreated → RabbitMQ
+    await publish_event("ReservationCreated", {
+        "reservation_id": reservation_id,
+        "test_id": body.test_id,
+        "switch_ids": [switch_seleccionado["id"]],
+        "expira_en": reservation["expira_en"],
+    })
+
+    return reservation
+
+
+@app.patch(
+    "/reservations/{reservation_id}/release",
+    response_model=ReservationResponse,
+    tags=["Reservations"],
+    summary="Liberar una reserva",
+    description="""
+Libera una reserva activa, marcándola como `RELEASED`.
+
+**Flujo:**
+1. Cambia estado de la reserva a `RELEASED`
+2. Publica evento `ReservationReleased` en **RabbitMQ**
+3. Scheduling consume el evento e inmediatamente:
+   - Marca el test dueño como `COMPLETED`
+   - Re-intenta asignar recursos a tests en `QUEUED`
+    """,
+)
+async def liberar_reservation(reservation_id: str, body: ReleaseRequest = ReleaseRequest()):
+    if reservation_id not in reservations:
+        raise HTTPException(status_code=404, detail=f"Reserva '{reservation_id}' no encontrada")
+
+    reservation = reservations[reservation_id]
+
+    if reservation["estado"] != "ACTIVE":
+        raise HTTPException(
+            status_code=409,
+            detail=f"La reserva tiene estado '{reservation['estado']}' y no puede liberarse",
+        )
+
+    reservation["estado"] = "RELEASED"
+    reservation["liberada_en"] = datetime.utcnow().isoformat() + "Z"
+
+    # Publicar evento ReservationReleased → RabbitMQ
+    await publish_event("ReservationReleased", {
+        "reservation_id": reservation_id,
+        "test_id": reservation["test_id"],
+        "switch_ids": reservation["switch_ids"],
+        "motivo": body.motivo,
+    })
+
+    return reservation
+
+
+@app.delete(
+    "/reservations/{reservation_id}",
+    tags=["Reservations"],
+    summary="Eliminar una reserva del registro",
+    description="Elimina una reserva del registro en memoria. Solo para testing/limpieza.",
+)
+def eliminar_reservation(reservation_id: str):
+    if reservation_id not in reservations:
+        raise HTTPException(status_code=404, detail=f"Reserva '{reservation_id}' no encontrada")
+    del reservations[reservation_id]
+    return {"mensaje": f"Reserva '{reservation_id}' eliminada"}

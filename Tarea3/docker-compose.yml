@@ -1,0 +1,70 @@
+version: "3.9"
+
+services:
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"    # AMQP (mensajería)
+      - "15672:15672"  # Management UI (http://localhost:15672)
+    networks:
+      - testbed-net
+    environment:
+      - RABBITMQ_DEFAULT_USER=admin
+      - RABBITMQ_DEFAULT_PASS=admin
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  inventory:
+    build:
+      context: ./inventory
+    container_name: inventory
+    ports:
+      - "8001:8001"
+    networks:
+      - testbed-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  reservation:
+    build:
+      context: ./reservation
+    container_name: reservation
+    ports:
+      - "8002:8002"
+    networks:
+      - testbed-net
+    depends_on:
+      inventory:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      - INVENTORY_URL=http://inventory:8001
+      - RABBITMQ_URL=amqp://admin:admin@rabbitmq:5672/
+
+  scheduling:
+    build:
+      context: ./scheduling
+    container_name: scheduling
+    ports:
+      - "8003:8003"
+    networks:
+      - testbed-net
+    depends_on:
+      - reservation
+      - rabbitmq
+    environment:
+      - RESERVATION_URL=http://reservation:8002
+      - RABBITMQ_URL=amqp://admin:admin@rabbitmq:5672/
+
+networks:
+  testbed-net:
+    driver: bridge
