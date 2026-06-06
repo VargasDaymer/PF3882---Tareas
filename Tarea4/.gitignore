@@ -1,0 +1,16 @@
+# Entorno virtual
+.venv/
+venv/
+env/
+
+# Pycache
+__pycache__/
+*.pyc
+*.pyo
+
+# Pact logs temporales
+pact/logs/
+pact/pacts/
+
+# pytest
+.pytest_cache/

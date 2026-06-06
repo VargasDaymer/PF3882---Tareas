@@ -1,0 +1,4 @@
+pact-python==1.7.0
+pytest==8.2.0
+requests==2.32.0
+requests-mock==1.12.1
