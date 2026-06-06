@@ -1,6 +1,0 @@
-pact-python==1.7.0
-pytest==8.2.0
-requests==2.32.0
-fastapi==0.111.0
-uvicorn==0.30.1
-pydantic==2.7.1
