@@ -1,0 +1,48 @@
+version: "3.9"
+
+services:
+
+  inventory:
+    build:
+      context: ./inventory
+    container_name: inventory
+    ports:
+      - "8001:8001"
+    networks:
+      - testbed-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  reservation:
+    build:
+      context: ./reservation
+    container_name: reservation
+    ports:
+      - "8002:8002"
+    networks:
+      - testbed-net
+    depends_on:
+      inventory:
+        condition: service_healthy
+    environment:
+      - INVENTORY_URL=http://inventory:8001
+
+  scheduling:
+    build:
+      context: ./scheduling
+    container_name: scheduling
+    ports:
+      - "8003:8003"
+    networks:
+      - testbed-net
+    depends_on:
+      - reservation
+    environment:
+      - RESERVATION_URL=http://reservation:8002
+
+networks:
+  testbed-net:
+    driver: bridge
