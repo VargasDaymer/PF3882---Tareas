@@ -1,11 +1,14 @@
 import uuid
+import logging
 import httpx
 import strawberry
 import asyncio
+from contextvars import ContextVar
 from datetime import datetime
 from typing import List, Optional
 from fastapi import FastAPI
 from strawberry.fastapi import GraphQLRouter
+from starlette.middleware.base import BaseHTTPMiddleware
 
 RESERVATION_URL = "http://reservation:8002"
 REINTENTO_INTERVAL_SEGUNDOS = 10  # Intenta cada 10 segundos. (Poco eficiente, pero suficiente)
@@ -101,10 +104,6 @@ async def solicitar_reserva(
     numero_puertos_min: Optional[int],
     duracion_minutos: int,
 ) -> Optional[dict]:
-    """
-    Solicita una reserva en Reservation Service con criterios técnicos.
-    Reservation se encargará de buscar en Inventory los switches compatibles.
-    """
     async with httpx.AsyncClient() as client:
         try:
             payload = {
@@ -118,10 +117,15 @@ async def solicitar_reserva(
                 payload["sku"] = sku
             if numero_puertos_min:
                 payload["numero_puertos_min"] = numero_puertos_min
-            
+
+            # Propagamos el Correlation ID a Reservation
+            headers = {"X-Correlation-ID": correlation_id_var.get("-")}
+            logger.info("→ POST Reservation /reservations test_id=%s", test_id)
+
             response = await client.post(
                 f"{RESERVATION_URL}/reservations",
                 json=payload,
+                headers=headers,
                 timeout=5.0,
             )
             if response.status_code == 201:
@@ -357,6 +361,38 @@ Esto permite que otros tests en QUEUED sean automáticamente asignados en el sig
         )
 
 
+# ── Correlation ID ─────────────────────────────────────────────────────────────
+correlation_id_var: ContextVar[str] = ContextVar("correlation_id", default="-")
+
+
+class CorrelationIdFilter(logging.Filter):
+    def filter(self, record):
+        record.correlation_id = correlation_id_var.get("-")
+        return True
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(logging.Formatter(
+    "%(asctime)s | corr=%(correlation_id)s | %(levelname)s | %(message)s"
+))
+_handler.addFilter(CorrelationIdFilter())
+logger = logging.getLogger("scheduling")
+logger.setLevel(logging.INFO)
+logger.addHandler(_handler)
+logger.propagate = False
+
+
+class CorrelationIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        corr_id = request.headers.get("X-Correlation-ID", str(uuid.uuid4()))
+        correlation_id_var.set(corr_id)
+        logger.info("→ %s %s", request.method, request.url.path)
+        response = await call_next(request)
+        response.headers["X-Correlation-ID"] = corr_id
+        logger.info("← %s %s %s", request.method, request.url.path, response.status_code)
+        return response
+
+
 # ── App FastAPI + GraphQL ──────────────────────────────────────────────────────
 
 schema = strawberry.Schema(query=Query, mutation=Mutation)
@@ -381,6 +417,7 @@ cuando los recursos no están disponibles de inmediato.
     version="1.0.0",
 )
 
+app.add_middleware(CorrelationIdMiddleware)
 app.include_router(graphql_app, prefix="/graphql")
 
 

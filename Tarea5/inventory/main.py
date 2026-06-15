@@ -1,8 +1,12 @@
 import json
+import logging
 import os
+import uuid
+from contextvars import ContextVar
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 
 app = FastAPI(
     title="Inventory Service",
@@ -48,6 +52,41 @@ class Switch(BaseModel):
     switch_ip: str
     hub_port: int
 
+
+# ── Correlation ID ─────────────────────────────────────────────────────────────
+correlation_id_var: ContextVar[str] = ContextVar("correlation_id", default="-")
+
+
+class CorrelationIdFilter(logging.Filter):
+    def filter(self, record):
+        record.correlation_id = correlation_id_var.get("-")
+        return True
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(logging.Formatter(
+    "%(asctime)s | corr=%(correlation_id)s | %(levelname)s | %(message)s"
+))
+_handler.addFilter(CorrelationIdFilter())
+logger = logging.getLogger("inventory")
+logger.setLevel(logging.INFO)
+logger.addHandler(_handler)
+logger.propagate = False
+
+
+class CorrelationIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        corr_id = request.headers.get("X-Correlation-ID", str(uuid.uuid4()))
+        correlation_id_var.set(corr_id)
+        logger.info("→ %s %s", request.method, request.url.path)
+        response = await call_next(request)
+        response.headers["X-Correlation-ID"] = corr_id
+        logger.info("← %s %s %s", request.method, request.url.path, response.status_code)
+        return response
+
+
+app.add_middleware(CorrelationIdMiddleware)
+# ──────────────────────────────────────────────────────────────────────────────
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 

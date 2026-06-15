@@ -1,54 +1,115 @@
-# Switch Testbed — Tarea #2: APIs REST y GraphQL
+# Switch Testbed — Tarea #5: Correlation IDs en microservicios
 
-Implementación de 3 microservicios del sistema **Switch Testbed Reservation System**:
+## Correlation IDs: Trazabilidad distribuida
 
-| Servicio | Tipo | Puerto | Descripción |
-|---|---|---|---|
-| **Inventory** | REST | 8001 | Catálogo de switches con datos fijos desde JSON |
-| **Reservation** | REST | 8002 | Reservas exclusivas de switches; consulta Inventory |
-| **Scheduling** | GraphQL | 8003 | Cola de tests; solicita reservas a Reservation |
+### Verificación del Correlation ID
 
-### Diagrama del sistema
-
+#### Paso 1: Levantar el sistema
+```bash
+docker compose up --build
 ```
-                          TESTERS (Clientes GraphQL)
-                                |
-                                |
-                ┌───────────────────────────────────┐
-                |                                   |
-                v                                   v
-           ┌─────────────┐              ┌──────────────────┐
-           | SCHEDULING  |              |    GraphQL       |
-           | (Puerto 8003|              |   http://       |
-           |  - Queue    |              |localhost:8003/  |
-           |  - Priority |              |    graphql      |
-           |  - Retries) |              └──────────────────┘
-           └──────┬──────┘
-                  |
-                  | REST POST /reservations
-                  | (busca criterios tecnicos)
-                  |
-                  v
-           ┌─────────────┐
-           | RESERVATION |
-           | (Puerto 8002|
-           |  - Valida   |
-           |  - Asigna   |
-           |  - Libera)  |
-           └──────┬──────┘
-                  |
-                  | REST GET /switches/compatible
-                  | (consulta segun criterios)
-                  |
-                  v
-           ┌─────────────┐
-           | INVENTORY   |
-           | (Puerto 8001|
-           |  - Catalogo |
-           |  - Estados  |
-           |  - Filtros) |
-           └─────────────┘
+
+#### Paso 2: Acceder a la interfaz interactiva del Scheduling Service
+
+Abre en tu navegador: **http://localhost:8003/graphql**
+
+#### Paso 3: Enviar un test con un Correlation ID personalizado
+
+**En GraphiQL, haz clic en Header debajo del editor** y añade:
+
+```json
+{
+  "X-Correlation-ID": "demo-flow"
+}
 ```
+
+Luego ejecuta la siguiente mutation en el editor:
+
+```graphql
+mutation {
+  submitTest(input: {
+    testerId: "tester-demo"
+    plataforma: "Aruba 800"
+    sku: "800.1"
+    requierePoe: true
+    topologia: "Standalone"
+    duracionMinutos: 60
+    prioridad: 5
+  }) {
+    success
+    message
+    testRequest {
+      id
+      estado
+      reservationId
+      creadaEn
+    }
+  }
+}
+```
+
+**Resultado esperado:** Deberías recibir una respuesta con:
+- `success: true`
+- Un `testRequest` con ID generado
+- Estado probablemente `SCHEDULED` (si hay switches disponibles)
+
+#### Paso 4: Verificar la propagación en los logs
+
+Abre una terminal y ejecuta:
+
+```bash
+# Ver logs de Scheduling (donde se recibió el request)
+docker logs scheduling 2>&1 | grep "demo-flow"
+
+# Ver logs de Reservation (servicio intermedio)
+docker logs reservation 2>&1 | grep "demo-flow"
+
+# Ver logs de Inventory (servicio final)
+docker logs inventory 2>&1 | grep "demo-flow"
+```
+
+**Resultado esperado:**
+
+Deberías ver el mismo Correlation ID (`demo-flow`) en todos los 3 servicios, mostrando el flujo completo.
+
+#### Paso 5: Verificar generación automática
+
+Si **no** proporcionas un `X-Correlation-ID` en el header, el sistema genera un UUID automáticamente.
+
+Vuelve a GraphiQL (http://localhost:8003/graphql) y:
+
+1. Borra el header personalizado.
+2. Ejecuta nuevamente la mutation.
+
+```graphql
+mutation {
+  submitTest(input: {
+    testerId: "tester-auto"
+    plataforma: "Aruba 850"
+    requierePoe: false
+    topologia: "Standalone"
+    duracionMinutos: 60
+    prioridad: 5
+  }) {
+    success
+    message
+    testRequest {
+      id
+      estado
+    }
+  }
+}
+```
+
+Luego busca en los logs con grep. Verás un UUID generado automáticamente propagándose por los 3 servicios:
+
+```bash
+# Los logs mostrarán algo como: corr=a1b2c3d4-e5f6-47ab-8c9d-0e1f2a3b4c5d
+docker logs scheduling 2>&1 | head -20
+```
+
+Nota: Como no especificaste un Correlation ID, verás un UUID largo (ej: `a1b2c3d4-e5f6-47ab-8c9d-0e1f2a3b4c5d`) que fue generado automáticamente y propagado a todos los servicios.
+
 
 ---
 ## Levantar el sistema
